@@ -10,31 +10,6 @@ void kakka_delay(uint32_t i)
 		;
 }
 
-// USART1_TX DMA request channel 2, USART1_RX DMA request channel 3
-// Can be remapped to 4, 5 respectively by setting a bit in SYSCFG_CFGR1.
-
-// DMA priorities 0 (lowest) .. 3 (highest)
-#define UART_TX_DMA_PRIORITY 1
-
-void usart_dma_tx(char* buf, uint16_t n)
-{
-	DMA1_Channel2->CPAR = (uint32_t)USART1->TDR;
-	DMA1_Channel2->CMAR = (uint32_t)buf;
-	DMA1_Channel2->CNDTR = n;
-	// Map USART1 TX to DMA channel 2, 8bit/8bit, memory increment, read from memory, enable
-	DMA1_Channel2->CCR = (UART_TX_DMA_PRIORITY << 12) | (1<<7) | (1<<4);
-	DMA1_Channel2->CCR |= DMA_CCR_EN;
-
-}
-
-void usart_print(char *buf)
-{
-	int n = strlen(buf);
-	if(n > 65535)
-		return;
-	usart_dma_tx(buf, n);
-}
-
 uint16_t v_mult = 5;
 uint16_t v_div = 4;
 
