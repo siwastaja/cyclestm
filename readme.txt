@@ -21,15 +21,15 @@ TSSOP20
  3 PF1    DIO unused - not connected
  4 NRST       reset - not connected
  5 VDDA       Analog 3V3
- 6 PA0     AI thermistor input
- 7 PA1     AI Sense Voltage measurement
+ 6 PA0     AI ADC0 thermistor input
+ 7 PA1     AI ADC1 Sense Voltage measurement
  8 PA2     DO PWM_HI/HI_ENA buck (charge) enable
  9 PA3     DO PWM_LO/LO_ENA boost (discharge) enable
-10 PA4     AI Direct output voltage measurement (for protection, mostly)
-11 PA5     AI Iref reference voltage measurement (very close to 50%), subtract from Imeas to get accurate I.
-12 PA6     AI Imeas, current measurement
-13 PA7     DO PWM I-set, valid range 0..50%
-14 PB1     DO PWM I+set, valid range 50%..100%
+10 PA4     AI ADC4 Direct output voltage measurement (for protection, mostly)
+11 PA5     AI ADC5 Iref reference voltage measurement (very close to 50%), subtract from Imeas to get accurate I.
+12 PA6     AI ADC6 Imeas, current measurement
+13 PA7     DO TIM3_CH2  PWM I-set, valid range 0..50%
+14 PB1     DO TIM3_CH4  PWM I+set, valid range 50%..100%
 15 VSS        GND
 16 VDD        Digital 3V3
 17 PA9    DIO I2C SCL, (UART TX when programming)

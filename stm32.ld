@@ -19,6 +19,11 @@ SECTIONS
         *(.text.*)
         *(.rodata)    /* Read only data */
         *(.rodata.*)        
+    } >rom
+
+    .data_init1 :
+    ALIGN(4)
+    {
         _DATAI_BEGIN = .;
     } >rom
 
@@ -28,9 +33,9 @@ SECTIONS
         *(.data)      /* Data memory */
         *(.data.*)        
         _DATA_END = .;
-    } >ram AT >rom
+    } >ram AT>rom
 
-    .data_init : 
+    .data_init2 : 
     {
         _DATAI_END = .;
     } >rom
