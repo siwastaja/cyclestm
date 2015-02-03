@@ -5,6 +5,7 @@ OBJCOPY = arm-none-eabi-objcopy
 
 CFLAGS = -I. -Os -fno-common -ffunction-sections -ffreestanding -fno-builtin -mcpu=cortex-m0 -mthumb -Wall -fstack-usage
 LDFLAGS = -mcpu=cortex-m0 -mthumb -nostartfiles -gc-sections
+# -L/usr/local/stm32/arm-none-eabi/lib/thumb -lc
 
 DEPS = main.h own_std.h
 OBJ = stm32init.o main.o own_std.o

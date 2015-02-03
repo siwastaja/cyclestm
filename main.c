@@ -1,3 +1,7 @@
+#define OWN_ID 2
+#define OWN_ID_STR ";2:"
+
+
 #include <stdint.h>
 #include <string.h>
 
@@ -12,20 +16,23 @@ void kakka_delay(uint32_t i)
 }
 
 int v_mult = 5000;
-int v_div = 65535;
+#define V_SHIFT 16
 
-int32_t i_mult = 20;
-int32_t i_div = 1;
+#define V_DIRECT_MAX 5500
+#define V_DIRECT_MAX_DELTA 1000
+int v_direct_mult = 6600;
+#define V_DIRECT_SHIFT 12 // from a single ADC value
+
+#define v_direct() ((adc_data[15].v_direct*v_direct_mult)>>V_DIRECT_SHIFT)
 
 #define STATE_OFF  0
 #define STATE_CHA  1
 #define STATE_DSCH 2
 #define STATE_ERR  3
 
-uint8_t cur_state = STATE_OFF;
+volatile int cur_state = STATE_OFF;
 
-#define MODE_CC 0
-#define MODE_CV 1
+volatile int mode_cv = 0;
 
 #define MIN_VOLTAGE 100
 #define MAX_VOLTAGE 4800
@@ -37,26 +44,56 @@ uint8_t cur_state = STATE_OFF;
 char tx_buf[TX_BUF_SIZE+1];
 #define RX_BUF_SIZE 50
 char rx_buf[RX_BUF_SIZE+1];
-int rx_point;
+volatile int rx_point;
+
+#define RED_ON()  {GPIOA->ODR &= ~(1UL << 14);}
+#define RED_OFF() {GPIOA->ODR |= 1UL << 14;}
+#define GREEN_ON()  {GPIOA->ODR &= ~(1UL << 13);}
+#define GREEN_OFF() {GPIOA->ODR |= 1UL << 13;}
 
 
-void usart_dma_tx(const char* buf, uint16_t n)
+volatile int print_disallow;
+
+void usart_print(const char *buf, int nmax)
 {
+	int timeout = 1000000;
+	int n = o_strnlen(buf, nmax);
+
+	if(n<1) return;
+
+//	RED_ON();
+	while(print_disallow)
+	{
+		timeout--;
+		if(timeout == 0)
+		{
+			DMA1->IFCR |= 0b100000;
+			break;
+		}
+	}
+//	RED_OFF();
+//	if(DMA1_Channel2->CCR & DMA_CCR_EN)
+//	{
+//		while(!((DMA1->ISR)&0b100000)) ;
+//	}
+//	DMA1->IFCR |= 0b100000;
+
+	__disable_irq();
+	GPIOA->MODER |= 0b10UL << 18; // TX pin to Alternate Function mode.
+	print_disallow = 1;
+	kakka_delay(50);
 	DMA1_Channel2->CCR &= ~DMA_CCR_EN;
 	DMA1_Channel2->CPAR = (uint32_t)&(USART1->TDR);
 	DMA1_Channel2->CMAR = (uint32_t)buf;
 	DMA1_Channel2->CNDTR = n;
-	// Map USART1 TX to DMA channel 2, 8bit/8bit, memory increment, read from memory, enable
-	DMA1_Channel2->CCR = (UART_TX_DMA_PRIORITY << 12) | (1<<7) | (1<<4);
+	// Map USART1 TX to DMA channel 2, 8bit/8bit, memory increment, read from memory, transfer complete interrupt enable
+	DMA1_Channel2->CCR = (UART_TX_DMA_PRIORITY << 12) | (1<<7) | (1<<4) | (1<<3) | (1<<1);
 	DMA1_Channel2->CCR |= DMA_CCR_EN;
+	DMA1->IFCR |= 0b100000;
+	__enable_irq();
 }
 
 
-void usart_print(const char *buf, int nmax)
-{
-	int n = o_strnlen(buf, nmax);
-	usart_dma_tx(buf, n);
-}
 
 
 // SETV 4200
@@ -67,9 +104,24 @@ void usart_print(const char *buf, int nmax)
 // OFF
 // MEAS
 
-uint16_t v_setpoint = 3300;
-int16_t i_setpoint = 0;
+int v_setpoint = 3300;
+int i_setpoint;
+int i_override;
+int i_trim; // = 0
+int i_midpoint_trim; // = 0
+int i_stop;
+int v_stop;
 
+#define MAX_I_TRIM 1000
+#define MIN_I_TRIM -1000
+
+int v_sense;
+int i_meas;
+int t_ntc;
+
+
+int i_trim_ignore_cnt;
+#define I_TRIM_IGNORE_CNT_VAL 10000
 
 typedef struct
 {
@@ -83,42 +135,327 @@ typedef struct
 
 volatile adc_val_t adc_data[16];
 
+
+#define DO_OFF()   {GPIOA->ODR &= ~(0b1100UL);}
+#define DO_BUCK()  {DO_OFF(); GPIOA->ODR |= 0b0100UL;}
+#define DO_BOOST() {DO_OFF(); GPIOA->ODR |= 0b1000UL;}
+
+#define SET_POSLIMIT(n) {TIM3->CCR4 = (n);}
+#define SET_NEGLIMIT(n) {TIM3->CCR2 = (n);}
+
+#define I_MIDPOINT 32768
+#define MAX_POS_I 28000
+#define MIN_NEG_I -28000
+#define IDLE_POS_I (I_MIDPOINT+i_midpoint_trim+1000)
+#define IDLE_NEG_I (I_MIDPOINT+i_midpoint_trim-1000)
+
+
 void blink()
 {
-	GPIOA->ODR = 0b00UL << 13;
+	RED_OFF(); GREEN_OFF();
 	kakka_delay(400000);
-	GPIOA->ODR = 0b01UL << 13;
+	RED_ON();
 	kakka_delay(400000);
-	GPIOA->ODR = 0b10UL << 13;
+	RED_OFF(); GREEN_ON();
 	kakka_delay(400000);
-	GPIOA->ODR = 0b11UL << 13;
+	RED_OFF(); GREEN_OFF();
 	kakka_delay(400000);
 }
 
 
 
-void report_meas()
+void error(char code)
 {
-	int i;
-	int v_sense, i_ref, i_meas;
-	v_sense = 0;
-	i_ref = 0;
-	i_meas = 0;
-	for(i = 0; i < 16; i++)
+	static char msg[12] = ";FATAL x;\0\0";
+	DO_OFF();
+	__disable_irq();
+	SET_POSLIMIT(I_MIDPOINT+200);
+	SET_NEGLIMIT(I_MIDPOINT-200);
+
+	msg[7] = code;
+
+	while(1)
 	{
-		v_sense += adc_data[i].v_sense;
-		i_ref += adc_data[i].i_ref;
-		i_meas += adc_data[i].i_meas;
+		blink();
+		print_disallow = 0;
+		usart_print(msg, 12);
+		kakka_delay(1000000);
+	}
+}
+
+
+
+void set_hw_curr_limits()
+{
+	if(cur_state == STATE_CHA)
+	{
+		if(i_override < 0 || i_override > MAX_POS_I)
+			error('2');
+
+		int val = I_MIDPOINT + i_midpoint_trim + i_trim + i_override;
+
+		if(i_midpoint_trim < -1000 || i_midpoint_trim > 1000 || val < I_MIDPOINT-1000 || val > I_MIDPOINT+MAX_POS_I)
+			error('3');
+
+		SET_POSLIMIT(val);
+		SET_NEGLIMIT(IDLE_NEG_I);
+	}
+	else if(cur_state == STATE_DSCH)
+	{
+		if(i_override > 0 || i_override < MIN_NEG_I)
+			error('4');
+
+		int val = I_MIDPOINT + i_midpoint_trim + i_trim + i_override;
+
+		if(i_midpoint_trim < -1000 || i_midpoint_trim > 1000 || val < I_MIDPOINT+MIN_NEG_I || val > I_MIDPOINT+1000)
+			error('5');
+
+		SET_NEGLIMIT(val);
+		SET_POSLIMIT(IDLE_POS_I);
+	}
+}
+
+void off()
+{
+	cur_state = STATE_OFF;
+	DO_OFF();
+	SET_POSLIMIT(IDLE_POS_I);
+	SET_NEGLIMIT(IDLE_NEG_I);
+	i_trim = 0;
+	i_trim_ignore_cnt = I_TRIM_IGNORE_CNT_VAL;
+
+	blink();
+	RED_OFF(); GREEN_OFF();
+}
+
+void set_current(int current)
+{
+	if((cur_state == STATE_DSCH && current > 0) ||
+	   (cur_state == STATE_CHA && current < 0 ))
+	{
+		usart_print(";SETI SIGN ERR;\r\n", 30);
+		return;
 	}
 
+	i_setpoint = current;
+
+	if((cur_state == STATE_DSCH && i_override < current) ||
+	   (cur_state == STATE_CHA && i_override > current))
+		i_override = current;
+
+	usart_print(";SETI OK;\r\n", 20);
+	i_trim_ignore_cnt = I_TRIM_IGNORE_CNT_VAL;
+
+}
+
+void discharge()
+{
+	off();
+
+	if(i_setpoint >= 0 || i_setpoint < MIN_NEG_I)
+	{
+		usart_print(";DSCH PARAM ERR;\r\n", 30);
+		return;
+	}
+
+	i_override = i_setpoint;
+
+	DO_BOOST();
+	cur_state = STATE_DSCH;
+	RED_ON(); GREEN_OFF();
+
+}
+
+void charge()
+{
+	off();
+
+	if(i_setpoint <= 0 || i_setpoint > MAX_POS_I)
+	{
+		usart_print(";CHA PARAM ERR;\r\n", 30);
+		return;
+	}
+
+	i_override = i_setpoint;
+
+
+	DO_BUCK();
+	cur_state = STATE_CHA;
+	GREEN_ON(); RED_OFF();
+}
+
+void calc_adc_vals()
+{
+	int calc_v_sense = 0;
+	int calc_i_ref = 0;
+	int calc_i_meas = 0;
+	int calc_ntc = 0;
+	int i;
+	for(i = 0; i < 16; i++)
+	{
+		calc_v_sense += adc_data[i].v_sense;
+		calc_i_ref += adc_data[i].i_ref;
+		calc_i_meas += adc_data[i].i_meas;
+		calc_ntc += adc_data[i].t_ntc;
+	}
+	calc_i_meas -= calc_i_ref;
+	calc_v_sense *= v_mult;
+	calc_v_sense >>= V_SHIFT;
+	__disable_irq();
+	v_sense = calc_v_sense;
+	i_meas = calc_i_meas;
+	t_ntc = calc_ntc;
+	__enable_irq();
+}
+
+#define CV_DEADBAND 10
+#define CV_REACT_RATE 1
+#define I_TRIM_REACT_RATE 1
+
+
+void adjust_i_trim()
+{
+	if(i_trim_ignore_cnt)
+	{
+		i_trim_ignore_cnt--;
+		return;
+	}
+	i_trim_ignore_cnt=10;
+
+	if(i_meas > i_override)
+	{
+		i_trim -= ((i_meas-i_override)>>2)*I_TRIM_REACT_RATE;
+		if(i_trim < MIN_I_TRIM)
+			i_trim = MIN_I_TRIM;
+	}
+	else if(i_meas < i_override)
+	{
+		i_trim += ((i_override-i_meas)>>2)*I_TRIM_REACT_RATE;
+		if(i_trim > MAX_I_TRIM)
+			i_trim = MAX_I_TRIM;
+	}
+}
+
+void adjust_charge()
+{
+	if(v_sense > v_setpoint+CV_DEADBAND)
+	{
+		i_override -= (v_sense-v_setpoint)*CV_REACT_RATE;
+		if(i_override < 0)
+		{
+			off();
+		}
+	}
+	else if(v_sense < v_setpoint-CV_DEADBAND && i_override < i_setpoint)
+	{
+		i_override += (v_setpoint-v_sense)*CV_REACT_RATE;
+		if(i_override >= i_setpoint)
+			i_override = i_setpoint;
+	}
+
+	if(i_override > i_setpoint || i_override < 0)
+		error('6');
+
+	adjust_i_trim();
+
+	mode_cv = (i_override != i_setpoint);
+
+	if(i_override <= i_stop || v_sense >= v_stop)
+	{
+		off();
+	}
+}
+
+void adjust_discharge()
+{
+	if(v_sense < v_setpoint-CV_DEADBAND)
+	{
+		i_override += (v_setpoint-v_sense)*CV_REACT_RATE;
+		if(i_override > 0)
+		{
+			off();
+		}
+	}
+	else if(v_sense > v_setpoint+CV_DEADBAND && i_override > i_setpoint)
+	{
+		i_override -= (v_sense-v_setpoint)*CV_REACT_RATE;
+		if(i_override <= i_setpoint)
+			i_override = i_setpoint;
+	}
+
+	if(i_override < i_setpoint || i_override > 0)
+		error('7');
+
+	adjust_i_trim();
+
+	mode_cv = (i_override != i_setpoint);
+
+	if(i_override >= i_stop || v_sense <= v_stop)
+	{
+		off();
+	}
+}
+
+void report_params()
+{
 	char* out = tx_buf;
-	out = o_str_append(out, ";MEAS V=");
+	out = o_str_append(out, OWN_ID_STR);
+
+	out = o_str_append(out, " Vset=");
+	out = o_utoa16(v_setpoint, out);
+	out = o_str_append(out, " Iset=");
+	out = o_itoa16(i_setpoint, out);
+	out = o_str_append(out, " Istop=");
+	out = o_itoa16(i_stop, out);
+	out = o_str_append(out, " Vstop=");
+	out = o_utoa16(v_stop, out);
+	out = o_str_append(out, " Imidtrim=");
+	out = o_itoa16(i_midpoint_trim, out);
+
+	out = o_str_append(out, ";\r\n");
+	*out = 0;
+	usart_print(tx_buf, TX_BUF_SIZE);
+
+}
+
+void report_meas(int verbose)
+{
+//	calc_adc_vals();  // already done just before message parsing
+
+	char* out = tx_buf;
+	out = o_str_append(out, OWN_ID_STR);
+	out = o_str_append(out, "MEAS ");
+	if(cur_state == STATE_CHA)
+		out = o_str_append(out, "CHA ");
+	else if(cur_state == STATE_DSCH)
+		out = o_str_append(out, "DSCH ");
+	else if(cur_state == STATE_OFF)
+		out = o_str_append(out, "OFF ");
+	else
+		error('8');
+
+	out = o_str_append(out, mode_cv?"CV":"CC");
+
+	out = o_str_append(out, " V=");
 	out = o_utoa16(v_sense, out);
 	out = o_str_append(out, " I=");
-	out = o_utoa16(i_meas, out);
-	out = o_str_append(out, " REF=");
-	out = o_utoa16(i_ref, out);
-	out = o_str_append(out, ";");
+	out = o_itoa16(i_meas, out);
+	out = o_str_append(out, " T=");
+	out = o_utoa16(t_ntc, out);
+
+	if(verbose)
+	{
+		out = o_str_append(out, " Vdirect=");
+		out = o_utoa16(v_direct(), out);
+		out = o_str_append(out, " Tcpu=");
+		out = o_utoa16(adc_data[15].t_cpu, out);
+		out = o_str_append(out, " Iset=");
+		out = o_itoa16(i_override, out);
+		out = o_str_append(out, " Itrim=");
+		out = o_itoa16(i_trim, out);
+	}
+
+	out = o_str_append(out, ";\r\n");
 	*out = 0;
 	usart_print(tx_buf, TX_BUF_SIZE);
 
@@ -127,16 +464,19 @@ void report_meas()
 
 }
 
-#define OWN_ID 1
-
 void handle_message()
 {
 	int id = -1;
 	int val = 0;
 	char* p_msg;
 	char* p_val;
+
+
 	if(rx_buf[0] != '@')
+	{
+//		usart_print(";@ MISMATCH;", 20);
 		return;
+	}
 	p_msg = o_atoi_append(rx_buf, &id);
 	if(id != OWN_ID)
 	{
@@ -150,60 +490,131 @@ void handle_message()
 		return;
 	}
 
-	if((p_val = o_str_cmp(p_msg, "SETV")))
+	if((p_val = o_str_cmp(p_msg, "SETV ")))
 	{
 		o_atoi_append(p_val, &val);
 		if(val < 100 || val > 4500)
 		{
-			usart_print(";SETV OOR;", 20);
+			usart_print(";SETV OOR;\r\n", 20);
 		}
 		else
 		{
-			usart_print(";SETV OK;", 20);
+			usart_print(";SETV OK;\r\n", 20);
 			v_setpoint = val;
 		}
 	}
-	else if((p_val = o_str_cmp(p_msg, "SETI")))
+	else if((p_val = o_str_cmp(p_msg, "SETI ")))
 	{
 		o_atoi_append(p_val, &val);
 		if(val < -25000 || val > 25000)
 		{
-			usart_print(";SETI OOR;", 20);
+			usart_print(";SETI OOR;\r\n", 20);
 		}
 		else
 		{
-			usart_print(";SETI OK;", 20);
-			i_setpoint = val;
+			set_current(val);
+		}
+	}
+	else if((p_val = o_str_cmp(p_msg, "SETVSTOP ")))
+	{
+		o_atoi_append(p_val, &val);
+		if(val < 100 || val > 5000)
+		{
+			usart_print(";SETVSTOP OOR;\r\n", 20);
+		}
+		else
+		{
+			usart_print(";SETVSTOP OK;\r\n", 20);
+			v_stop = val;
+		}
+	}
+	else if((p_val = o_str_cmp(p_msg, "SETISTOP ")))
+	{
+		o_atoi_append(p_val, &val);
+		if(val < -25000 || val > 25000)
+		{
+			usart_print(";SETISTOP OOR;\r\n", 20);
+		}
+		else
+		{
+			usart_print(";SETISTOP OK;\r\n", 20);
+			i_stop = val;
+		}
+	}
+	else if((p_val = o_str_cmp(p_msg, "SETIMTRIM ")))
+	{
+		o_atoi_append(p_val, &val);
+		if(val < -5000 || val > 5000)
+		{
+			usart_print(";SETIMTRIM OOR;\r\n", 30);
+		}
+		else
+		{
+			usart_print(";SETIMTRIM OK;\r\n", 30);
+			i_midpoint_trim = val;
 		}
 	}
 	else if((p_val = o_str_cmp(p_msg, "MEAS")))
 	{
-		report_meas();
+		report_meas(0);
+	}
+	else if((p_val = o_str_cmp(p_msg, "VERBOSE")))
+	{
+		report_meas(1);
+	}
+	else if((p_val = o_str_cmp(p_msg, "PARAMS")))
+	{
+		report_params();
 	}
 	else if((p_val = o_str_cmp(p_msg, "DSCH")))
 	{
-		usart_print(";DSCH OK;", 20);
-		cur_state = STATE_DSCH;
+		usart_print(";DSCH OK;\r\n", 20);
+		discharge();
 	}
 	else if((p_val = o_str_cmp(p_msg, "CHA")))
 	{
-		usart_print(";CHA OK;", 20);
-		cur_state = STATE_CHA;
+		usart_print(";CHA OK;\r\n", 20);
+		charge();
 	}
 	else if((p_val = o_str_cmp(p_msg, "OFF")))
 	{
-		usart_print(";OFF OK;", 20);
-		cur_state = STATE_OFF;
+		usart_print(";OFF OK;\r\n", 20);
+		off();
 	}
 }
 
+void uart_dma_finished_handler()
+{
+	DMA1->IFCR |= 0b100000;
+	kakka_delay(17000);
+	GPIOA->MODER &= ~(0b11UL << 18); // TX pin to input mode
+	print_disallow = 0;
+}
+
+void input_overvoltage_handler()
+{
+	error('N');
+}
+
+volatile int do_handle_message;
+
 void uart_rx_handler()
 {
+//	static int checksum = 0;
+//	static char prev_byte;
+
 	char byte = USART1->RDR;
+//	checksum += byte;
 	if(USART1->ISR & USART_ISR_ORE)
 	{
 		USART1->ICR |= USART_ICR_ORECF;
-		usart_print(";COMMERR;", 20);
+//		usart_print(";COMMERR;", 20);
+	}
+	if(do_handle_message)
+	{
+		// Ignore incoming data if we are processing a command.
+//		usart_print(";BUSY;", 20);
+		return;
 	}
 
 	if(byte == ';')
@@ -211,12 +622,15 @@ void uart_rx_handler()
 		// rx_point holds the last position.
 		rx_buf[rx_point] = 0;
 //		usart_print(rx_buf, RX_BUF_SIZE);
-		handle_message();
+		do_handle_message = 1;
 		rx_point = 0;
 	}
 	else if(byte >= 32 && byte < 128)
 	{
 		// Ignore control characters and 8-bit characters.
+		// Buffer gets full? Just wrap it over, we will
+		// lose data. So always begin commands with the flushing
+		// ; character to be sure.
 		if(byte >= 'a' && byte <= 'z')
 			byte = byte - 'a' + 'A';
 		rx_buf[rx_point] = byte;
@@ -225,34 +639,9 @@ void uart_rx_handler()
 			rx_point = 0;
 	}
 
+//	prev_byte = byte;
 }
 
-
-#define DO_OFF()   {GPIOA->ODR &= ~(0b1100UL);}
-#define DO_BUCK()  {DO_OFF(); GPIOA->ODR |= 0b0100UL;}
-#define DO_BOOST() {DO_OFF(); GPIOA->ODR |= 0b1000UL;}
-
-void error()
-{
-	DO_OFF();
-	__disable_irq();
-	while(1)
-	{
-		usart_print(";ERROR;", 20);
-		kakka_delay(40000000);
-	}
-}
-
-void error2()
-{
-	DO_OFF();
-	__disable_irq();
-	while(1)
-	{
-		usart_print(";MUOVER;", 20);
-		kakka_delay(40000000);
-	}
-}
 
 int main()
 {
@@ -291,7 +680,10 @@ int main()
 //	GPIOB->AFR[1] = 0b00100010; // AF2 for both PORTB 8 & 9 (timers)
 
 	// USART1
-	GPIOA->MODER |= 0b1010UL << 18; // TX and RX pins to Alternate Function mode.
+	GPIOA->MODER |= 0b10UL << 20; // RX pin to Alternate Function mode.
+//	GPIOA->PUPDR |= 0b10UL << 18; // TX pin pulldown
+
+//	GPIOA->MODER |= 0b1010UL << 18; // RX and TX pins to Alternate Function mode.
 //	GPIOA->OSPEEDR |= 0b11UL << 18;
 	GPIOA->AFR[1] |= 0b0001UL << 4;
 	GPIOA->AFR[1] |= 0b0001UL << 8;
@@ -299,7 +691,8 @@ int main()
 // RX interrupt = RXNE. RXNEIE = enable control bit.
 
 	// 48 MHz system clock, 16x oversampling (OVER8 = 0)
-	USART1->BRR = 0x1388; // 0x1388 = 9600, 0x1a1 = 115200 bps
+//	USART1->BRR = 0x1388; // 9600 bps
+	USART1->BRR = 0x1a1;  // 115200 bps
 	USART1->CR1 = 0b101101; // RXNEIE + transmitter & receiver enable, usart enable, defaults (zeroes) good.
 	USART1->CR3 = (1<<7); // DMA enable transmitter
 
@@ -321,8 +714,8 @@ int main()
 	ADC1->SMPR = 0b101UL; // Sampling time = 55.5 ADC clock cycles
 	ADC1->TR = (4050 << 16) | (0); // Watchdog thresholds
 
-	ADC1->CHSELR = 0b00000000000000001UL; // 0,1,4,5,6,16(inttemp)
-//	ADC1->CHSELR = 0b10000000001110011UL; // 0,1,4,5,6,16(inttemp)
+//	ADC1->CHSELR = 0b00000000000000001UL; // 0,1,4,5,6,16(inttemp)
+	ADC1->CHSELR = 0b10000000001110011UL; // 0,1,4,5,6,16(inttemp)
 	ADC->CCR = ADC_CCR_TSEN; // temperature sensor enable
 
 	DMA1_Channel1->CCR |= 1UL;
@@ -331,51 +724,56 @@ int main()
 
 	// TODO: Protection for DMA blockage
 
-//	uint16_t v_set = 4200;
-//	int32_t i_set = 5000;
+	RED_OFF(); GREEN_OFF();
 
-	GPIOA->ODR = 0b11UL << 13;
+	int jes = 0;
+	for(jes = 0; jes < 20; jes++)
+		blink();
+
 
 	NVIC_EnableIRQ(USART1_IRQn);
+	NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
 	__enable_irq();
-//	USART1->TDR = 'a';
 
-	blink();
+/*	usart_print(".hei\n\r.", 10);
+	usart_print("heimoijoojuukatohehheh siwa siwa johannes kakka\n\r.", 200);
+	usart_print("hei\n\r.", 10);
 	usart_print("hei\n\r", 10);
-
+*/
+//	int i = 0;
 	while(1)
 	{
-/*		GPIOA->ODR = 0b00UL << 13;
-		kakka_delay(4000000);
-		GPIOA->ODR = 0b01UL << 13;
-		kakka_delay(4000000);
-		GPIOA->ODR = 0b10UL << 13;
-		kakka_delay(4000000);
-		GPIOA->ODR = 0b11UL << 13;
-		kakka_delay(4000000);
+/*		i++;
+		if(i == 100)
+			i = 0;
+		if(i == 3 || i == 15 || i > 50)
+			blink();
+		usart_print("abcd", 5);
 */
+		// TODO: use watchdog
 
-//		TIM3->CCR4 = adc_data[0].t_ntc*16;
-//		TIM3->CCR2 = adc_data[15].t_ntc*16;
+		while(!((DMA1->ISR)&0b10)) ;
+		DMA1->IFCR |= 0b10;
 
-//		USART1->TDR = 'a';
-//		usart_print(teksti);
-/*
-		if(i_setpoint < 0 && cur_state == STATE_CHA)
+		calc_adc_vals();
+
+//		if(v_direct() > V_DIRECT_MAX)
+//			error('V');
+
+//		if(v_direct() > v_sense + V_DIRECT_MAX_DELTA)
+//			error('v');
+
+		if(do_handle_message)
 		{
-			error();
+			handle_message();
+			do_handle_message = 0;
 		}
 
-		if(i_setpoint > 0 && cur_state == STATE_DSCH)
-		{
-			error();
-		}
-
-		if(v_setpoint > MAX_VOLTAGE || v_setpoint < MIN_VOLTAGE)
-		{
-			error();
-		}
-*/
+		if(cur_state == STATE_CHA)
+			adjust_charge();
+		else if(cur_state == STATE_DSCH)
+			adjust_discharge();
+		set_hw_curr_limits();
 	}
 }
 

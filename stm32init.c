@@ -6,10 +6,11 @@ void stm32init(void);
 void nmi_handler(void);
 void invalid_handler(void);
 
-extern void error();
-extern void error2();
+extern void error(int code);
 extern void main();
 extern void uart_rx_handler();
+extern void uart_dma_finished_handler();
+extern void input_overvoltage_handler();
 
 extern unsigned int _STACKTOP;
 
@@ -19,7 +20,7 @@ unsigned int * the_nvic_vector[64] __attribute__ ((section(".nvic_vector"))) =
 /* 0x0000                    */ (unsigned int *) &_STACKTOP,
 /* 0x0004 RESET              */ (unsigned int *) stm32init,
 /* 0x0008 NMI                */ (unsigned int *) nmi_handler,
-/* 0x000C HARDFAULT          */ (unsigned int *) error2,
+/* 0x000C HARDFAULT          */ (unsigned int *) invalid_handler,
 /* 0x0010                    */ (unsigned int *) invalid_handler,
 /* 0x0014                    */ (unsigned int *) invalid_handler,
 /* 0x0018                    */ (unsigned int *) invalid_handler,
@@ -42,7 +43,7 @@ unsigned int * the_nvic_vector[64] __attribute__ ((section(".nvic_vector"))) =
 /* 0x005C                    */ (unsigned int *) invalid_handler,
 /* 0x0060                    */ (unsigned int *) invalid_handler,
 /* 0x0064                    */ (unsigned int *) invalid_handler,
-/* 0x0068                    */ (unsigned int *) invalid_handler,
+/* 0x0068                    */ (unsigned int *) uart_dma_finished_handler,
 /* 0x006C                    */ (unsigned int *) invalid_handler,
 /* 0x0070                    */ (unsigned int *) invalid_handler,
 /* 0x0074                    */ (unsigned int *) invalid_handler,
@@ -132,5 +133,5 @@ void nmi_handler(void)
 
 void invalid_handler(void)
 {
-	error();
+	error('I');
 }
