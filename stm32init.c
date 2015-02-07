@@ -5,6 +5,7 @@
 void stm32init(void);
 void nmi_handler(void);
 void invalid_handler(void);
+void hardfault_handler();
 
 extern void error(int code);
 extern void main();
@@ -20,7 +21,7 @@ unsigned int * the_nvic_vector[64] __attribute__ ((section(".nvic_vector"))) =
 /* 0x0000                    */ (unsigned int *) &_STACKTOP,
 /* 0x0004 RESET              */ (unsigned int *) stm32init,
 /* 0x0008 NMI                */ (unsigned int *) nmi_handler,
-/* 0x000C HARDFAULT          */ (unsigned int *) invalid_handler,
+/* 0x000C HARDFAULT          */ (unsigned int *) hardfault_handler,
 /* 0x0010                    */ (unsigned int *) invalid_handler,
 /* 0x0014                    */ (unsigned int *) invalid_handler,
 /* 0x0018                    */ (unsigned int *) invalid_handler,
@@ -129,6 +130,11 @@ void stm32init(void)
 void nmi_handler(void)
 {
 	return;
+}
+
+void hardfault_handler(void)
+{
+	error('H');
 }
 
 void invalid_handler(void)

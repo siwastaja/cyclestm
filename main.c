@@ -1,6 +1,7 @@
 #define OWN_ID 2
 #define OWN_ID_STR ";2:"
 
+//#define DISABLE_TRIM
 
 #include <stdint.h>
 #include <string.h>
@@ -18,12 +19,16 @@ void kakka_delay(uint32_t i)
 int v_mult = 5000;
 #define V_SHIFT 16
 
+#define NUM_ADC_SAMPLES 64
+#define ADC_SHIFT 2 // from 64 summed samples to 16-bit value
+#define SECOND_FILT_LEN 128
+#define SECOND_FILT_SHIFT 7
+
+
 #define V_DIRECT_MAX 5500
 #define V_DIRECT_MAX_DELTA 1000
 int v_direct_mult = 6600;
-#define V_DIRECT_SHIFT 12 // from a single ADC value
-
-#define v_direct() ((adc_data[15].v_direct*v_direct_mult)>>V_DIRECT_SHIFT)
+#define V_DIRECT_SHIFT 16;
 
 #define STATE_OFF  0
 #define STATE_CHA  1
@@ -112,16 +117,24 @@ int i_midpoint_trim; // = 0
 int i_stop;
 int v_stop;
 
-#define MAX_I_TRIM 1000
-#define MIN_I_TRIM -1000
+#define MAX_I_TRIM 2000
+#define MIN_I_TRIM -2000
+#define COARSE_MIDPOINT_TRIM -1000
+#define MIN_MIDPOINT_TRIM -1000
+#define MAX_MIDPOINT_TRIM 1000
+
+int v_sense_midflt[SECOND_FILT_LEN];
+int i_meas_midflt[SECOND_FILT_LEN];
+int t_ntc_midflt[SECOND_FILT_LEN];
 
 int v_sense;
 int i_meas;
 int t_ntc;
+int v_direct;
 
 
 int i_trim_ignore_cnt;
-#define I_TRIM_IGNORE_CNT_VAL 10000
+#define I_TRIM_IGNORE_CNT_VAL 20
 
 typedef struct
 {
@@ -133,8 +146,7 @@ typedef struct
 	uint16_t t_cpu;
 } __attribute__((packed)) adc_val_t;
 
-volatile adc_val_t adc_data[16];
-
+volatile adc_val_t adc_data[NUM_ADC_SAMPLES];
 
 #define DO_OFF()   {GPIOA->ODR &= ~(0b1100UL);}
 #define DO_BUCK()  {DO_OFF(); GPIOA->ODR |= 0b0100UL;}
@@ -143,11 +155,11 @@ volatile adc_val_t adc_data[16];
 #define SET_POSLIMIT(n) {TIM3->CCR4 = (n);}
 #define SET_NEGLIMIT(n) {TIM3->CCR2 = (n);}
 
-#define I_MIDPOINT 32768
-#define MAX_POS_I 28000
-#define MIN_NEG_I -28000
-#define IDLE_POS_I (I_MIDPOINT+i_midpoint_trim+1000)
-#define IDLE_NEG_I (I_MIDPOINT+i_midpoint_trim-1000)
+#define I_MIDPOINT (32768+COARSE_MIDPOINT_TRIM)
+#define MAX_POS_I 29000
+#define MIN_NEG_I -29000
+#define IDLE_POS_I (I_MIDPOINT+i_midpoint_trim+2000)
+#define IDLE_NEG_I (I_MIDPOINT+i_midpoint_trim-2000)
 
 
 void blink()
@@ -169,8 +181,8 @@ void error(char code)
 	static char msg[12] = ";FATAL x;\0\0";
 	DO_OFF();
 	__disable_irq();
-	SET_POSLIMIT(I_MIDPOINT+200);
-	SET_NEGLIMIT(I_MIDPOINT-200);
+	SET_POSLIMIT(I_MIDPOINT+1000);
+	SET_NEGLIMIT(I_MIDPOINT-1000);
 
 	msg[7] = code;
 
@@ -192,9 +204,13 @@ void set_hw_curr_limits()
 		if(i_override < 0 || i_override > MAX_POS_I)
 			error('2');
 
-		int val = I_MIDPOINT + i_midpoint_trim + i_trim + i_override;
+		int val = I_MIDPOINT + i_midpoint_trim + i_override;
+#ifndef DISABLE_TRIM
+		val += i_trim;
+#endif
 
-		if(i_midpoint_trim < -1000 || i_midpoint_trim > 1000 || val < I_MIDPOINT-1000 || val > I_MIDPOINT+MAX_POS_I)
+		if(i_midpoint_trim < MIN_MIDPOINT_TRIM || i_midpoint_trim > MAX_MIDPOINT_TRIM ||
+		   val < I_MIDPOINT+MIN_MIDPOINT_TRIM || val > I_MIDPOINT+MAX_POS_I)
 			error('3');
 
 		SET_POSLIMIT(val);
@@ -205,9 +221,14 @@ void set_hw_curr_limits()
 		if(i_override > 0 || i_override < MIN_NEG_I)
 			error('4');
 
-		int val = I_MIDPOINT + i_midpoint_trim + i_trim + i_override;
+		int val = I_MIDPOINT + i_midpoint_trim + i_override;
 
-		if(i_midpoint_trim < -1000 || i_midpoint_trim > 1000 || val < I_MIDPOINT+MIN_NEG_I || val > I_MIDPOINT+1000)
+#ifndef DISABLE_TRIM
+		val += i_trim;
+#endif
+
+		if(i_midpoint_trim < MIN_MIDPOINT_TRIM || i_midpoint_trim > MAX_MIDPOINT_TRIM ||
+		   val < I_MIDPOINT+MIN_NEG_I || val > I_MIDPOINT+MAX_MIDPOINT_TRIM)
 			error('5');
 
 		SET_NEGLIMIT(val);
@@ -257,6 +278,7 @@ void discharge()
 		usart_print(";DSCH PARAM ERR;\r\n", 30);
 		return;
 	}
+	usart_print(";DSCH OK;\r\n", 30);
 
 	i_override = i_setpoint;
 
@@ -275,6 +297,7 @@ void charge()
 		usart_print(";CHA PARAM ERR;\r\n", 30);
 		return;
 	}
+	usart_print(";CHA OK;\r\n", 30);
 
 	i_override = i_setpoint;
 
@@ -284,34 +307,65 @@ void charge()
 	GREEN_ON(); RED_OFF();
 }
 
-void calc_adc_vals()
+void calc_second_filt()
+{
+	int i;
+	int calc_v_sense = 0;
+	int calc_i_meas = 0;
+	int calc_t_ntc = 0;
+	for(i = 0; i < SECOND_FILT_LEN; i++)
+	{
+		calc_v_sense += v_sense_midflt[i];
+		calc_i_meas += i_meas_midflt[i];
+		calc_t_ntc += t_ntc_midflt[i];
+	}
+
+	calc_v_sense >>= SECOND_FILT_SHIFT;
+	calc_i_meas >>= SECOND_FILT_SHIFT;
+	calc_t_ntc >>= SECOND_FILT_SHIFT;
+
+	v_sense = calc_v_sense;
+	i_meas = calc_i_meas;
+	t_ntc = calc_t_ntc;
+}
+
+void calc_adc_vals(int idx)
 {
 	int calc_v_sense = 0;
 	int calc_i_ref = 0;
 	int calc_i_meas = 0;
 	int calc_ntc = 0;
+	int calc_v_direct = 0;
 	int i;
-	for(i = 0; i < 16; i++)
+
+	for(i = 0; i < NUM_ADC_SAMPLES; i++)
 	{
 		calc_v_sense += adc_data[i].v_sense;
 		calc_i_ref += adc_data[i].i_ref;
 		calc_i_meas += adc_data[i].i_meas;
 		calc_ntc += adc_data[i].t_ntc;
+		calc_v_direct += adc_data[i].v_direct;
 	}
+	calc_v_sense >>= ADC_SHIFT; // don't combine with later shift, there is too little headroom in int.
+	calc_i_meas >>= ADC_SHIFT;
+	calc_i_ref >>= ADC_SHIFT;
+	calc_ntc >>= ADC_SHIFT;
+	calc_v_direct >>= ADC_SHIFT;
 	calc_i_meas -= calc_i_ref;
 	calc_v_sense *= v_mult;
+	calc_v_direct *= v_direct_mult;
+	calc_v_direct >>= V_DIRECT_SHIFT;
 	calc_v_sense >>= V_SHIFT;
-	__disable_irq();
-	v_sense = calc_v_sense;
-	i_meas = calc_i_meas;
-	t_ntc = calc_ntc;
-	__enable_irq();
+
+	v_sense_midflt[idx] = calc_v_sense;
+	i_meas_midflt[idx] = calc_i_meas;
+	t_ntc_midflt[idx] = calc_ntc;
+	v_direct = calc_v_direct;
 }
 
-#define CV_DEADBAND 10
+#define CV_DEADBAND 2
 #define CV_REACT_RATE 1
-#define I_TRIM_REACT_RATE 1
-
+#define I_TRIM_REACT_SLOWDOWN 3
 
 void adjust_i_trim()
 {
@@ -320,17 +374,16 @@ void adjust_i_trim()
 		i_trim_ignore_cnt--;
 		return;
 	}
-	i_trim_ignore_cnt=10;
 
 	if(i_meas > i_override)
 	{
-		i_trim -= ((i_meas-i_override)>>2)*I_TRIM_REACT_RATE;
+		i_trim -= (i_meas-i_override)>>I_TRIM_REACT_SLOWDOWN;
 		if(i_trim < MIN_I_TRIM)
 			i_trim = MIN_I_TRIM;
 	}
 	else if(i_meas < i_override)
 	{
-		i_trim += ((i_override-i_meas)>>2)*I_TRIM_REACT_RATE;
+		i_trim += (i_override-i_meas)>>I_TRIM_REACT_SLOWDOWN;
 		if(i_trim > MAX_I_TRIM)
 			i_trim = MAX_I_TRIM;
 	}
@@ -420,8 +473,6 @@ void report_params()
 
 void report_meas(int verbose)
 {
-//	calc_adc_vals();  // already done just before message parsing
-
 	char* out = tx_buf;
 	out = o_str_append(out, OWN_ID_STR);
 	out = o_str_append(out, "MEAS ");
@@ -446,9 +497,9 @@ void report_meas(int verbose)
 	if(verbose)
 	{
 		out = o_str_append(out, " Vdirect=");
-		out = o_utoa16(v_direct(), out);
+		out = o_utoa16(v_direct, out);
 		out = o_str_append(out, " Tcpu=");
-		out = o_utoa16(adc_data[15].t_cpu, out);
+		out = o_utoa16(adc_data[NUM_ADC_SAMPLES-1].t_cpu, out);
 		out = o_str_append(out, " Iset=");
 		out = o_itoa16(i_override, out);
 		out = o_str_append(out, " Itrim=");
@@ -541,16 +592,16 @@ void handle_message()
 			i_stop = val;
 		}
 	}
-	else if((p_val = o_str_cmp(p_msg, "SETIMTRIM ")))
+	else if((p_val = o_str_cmp(p_msg, "SETTRIM ")))
 	{
 		o_atoi_append(p_val, &val);
-		if(val < -5000 || val > 5000)
+		if(val < MIN_MIDPOINT_TRIM || val > MAX_MIDPOINT_TRIM)
 		{
-			usart_print(";SETIMTRIM OOR;\r\n", 30);
+			usart_print(";SETTRIM OOR;\r\n", 30);
 		}
 		else
 		{
-			usart_print(";SETIMTRIM OK;\r\n", 30);
+			usart_print(";SETTRIM OK;\r\n", 30);
 			i_midpoint_trim = val;
 		}
 	}
@@ -558,22 +609,20 @@ void handle_message()
 	{
 		report_meas(0);
 	}
-	else if((p_val = o_str_cmp(p_msg, "VERBOSE")))
+	else if((p_val = o_str_cmp(p_msg, "VERB")))
 	{
 		report_meas(1);
 	}
-	else if((p_val = o_str_cmp(p_msg, "PARAMS")))
+	else if((p_val = o_str_cmp(p_msg, "PAR")))
 	{
 		report_params();
 	}
 	else if((p_val = o_str_cmp(p_msg, "DSCH")))
 	{
-		usart_print(";DSCH OK;\r\n", 20);
 		discharge();
 	}
 	else if((p_val = o_str_cmp(p_msg, "CHA")))
 	{
-		usart_print(";CHA OK;\r\n", 20);
 		charge();
 	}
 	else if((p_val = o_str_cmp(p_msg, "OFF")))
@@ -672,9 +721,7 @@ int main()
 	TIM3->CCER = 1UL<<12 | 1UL<<4; // Channels2,4 enable
 	// Prescaler 0 (0+1 = 1) by default
 
-	TIM3->CCR2 = 10000;
-	TIM3->CCR4 = 50000;
-
+	off();
 
 //	GPIOB->MODER = 0b1010UL << 16; // Timer 16&17 outputs (PORTB 8&9)
 //	GPIOB->AFR[1] = 0b00100010; // AF2 for both PORTB 8 & 9 (timers)
@@ -700,7 +747,7 @@ int main()
 	// Enable DMA: channel 1 for ADC.
 	DMA1_Channel1->CPAR = (uint32_t)&(ADC1->DR);
 	DMA1_Channel1->CMAR = (uint32_t)(adc_data);
-	DMA1_Channel1->CNDTR = 6*16;
+	DMA1_Channel1->CNDTR = 6*NUM_ADC_SAMPLES;
 	DMA1_Channel1->CCR = 0b011010110101000UL; // very high prio, 16b->16b, MemIncrement, circular, transfer error interrupt, enable.
 
 	// Enable and self-calibrate ADC.
@@ -727,7 +774,7 @@ int main()
 	RED_OFF(); GREEN_OFF();
 
 	int jes = 0;
-	for(jes = 0; jes < 20; jes++)
+	for(jes = 0; jes < 5; jes++)
 		blink();
 
 
@@ -743,26 +790,53 @@ int main()
 //	int i = 0;
 	while(1)
 	{
-/*		i++;
-		if(i == 100)
-			i = 0;
-		if(i == 3 || i == 15 || i > 50)
-			blink();
-		usart_print("abcd", 5);
-*/
-		// TODO: use watchdog
+		int sampleset;
 
-		while(!((DMA1->ISR)&0b10)) ;
-		DMA1->IFCR |= 0b10;
+		// Let the DMA handle NUM_ADC_SAMPLES from every channel.
+		// Average those when they are available.
+		for(sampleset = 0; sampleset < SECOND_FILT_LEN; sampleset++)
+		{
+			while(!((DMA1->ISR)&0b10)) ;
+			DMA1->IFCR |= 0b10;
+			calc_adc_vals(sampleset);
+			// Do time critical checking here:
+			// the values are filtered enough to prevent spikes,
+			// but the current measurement especially still has
+			// too much noise for real logging.
 
-		calc_adc_vals();
+			if(cur_state == STATE_CHA || cur_state == STATE_DSCH)
+			{
+				// Sudden voltage spike, due to battery disconnection etc.
+				if((cur_state == STATE_CHA && v_sense_midflt[sampleset] > v_stop+500) ||
+				   (cur_state == STATE_DSCH && v_sense_midflt[sampleset] < v_stop-500))
+					error('v');
 
-//		if(v_direct() > V_DIRECT_MAX)
-//			error('V');
+				if(v_direct > v_sense + V_DIRECT_MAX_DELTA)
+					error('w');
+			}
 
-//		if(v_direct() > v_sense + V_DIRECT_MAX_DELTA)
-//			error('v');
+			if(v_direct > V_DIRECT_MAX)
+				error('V');
 
+			if(do_handle_message)
+			{
+				// Handle messages more quickly.
+				// Will still have older data in the buffer
+				// but it will behave like a ring buffer
+				// thing.
+				break;
+			}
+
+
+		}
+
+		// After SECOND_FILT_LEN samples, average the averages (yo dawg)
+
+		calc_second_filt();
+
+
+		// You really need to wait for the acknowledgement message
+		// because messages are handled here.
 		if(do_handle_message)
 		{
 			handle_message();
