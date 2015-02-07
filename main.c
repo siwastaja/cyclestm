@@ -1,5 +1,5 @@
-#define OWN_ID 2
-#define OWN_ID_STR ";2:"
+#define OWN_ID 1
+#define OWN_ID_STR ";1:"
 
 //#define DISABLE_TRIM
 
@@ -730,8 +730,6 @@ int main()
 	GPIOA->MODER |= 0b10UL << 20; // RX pin to Alternate Function mode.
 //	GPIOA->PUPDR |= 0b10UL << 18; // TX pin pulldown
 
-//	GPIOA->MODER |= 0b1010UL << 18; // RX and TX pins to Alternate Function mode.
-//	GPIOA->OSPEEDR |= 0b11UL << 18;
 	GPIOA->AFR[1] |= 0b0001UL << 4;
 	GPIOA->AFR[1] |= 0b0001UL << 8;
 
