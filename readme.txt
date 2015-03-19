@@ -28,8 +28,8 @@ TSSOP20
 10 PA4     AI ADC4 Direct output voltage measurement (for protection, mostly)
 11 PA5     AI ADC5 Iref reference voltage measurement (very close to 50%), subtract from Imeas to get accurate I.
 12 PA6     AI ADC6 Imeas, current measurement
-13 PA7     DO TIM3_CH2  PWM I-set, valid range 0..50%
-14 PB1     DO TIM3_CH4  PWM I+set, valid range 50%..100%
+13 PA7     DO TIM3_CH2  PWM I-set, valid range maybe about 10..50%
+14 PB1     DO TIM3_CH4  PWM I+set, valid range maybe about 50%..90%
 15 VSS        GND
 16 VDD        Digital 3V3
 17 PA9    DIO UART TX
