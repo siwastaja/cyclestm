@@ -64,7 +64,7 @@ Format:  @ID:command [parameter];
 @1:PAR;          print the actual settings
 
 
-Currents less than 2000 mA may be unreliable for now.
+Currents less than 2000 mA may be unreliable for now (some modules seem to be better than others)
 
 Negative currents for discharge, positive for charge.
 (Wrong sign / out-of-range are checked by the CPU.)
