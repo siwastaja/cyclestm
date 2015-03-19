@@ -1,3 +1,7 @@
+IMPORTANT: Safety mechanisms not properly implemented yet; make sure there always
+is a battery connected to both sides and that the 12V side does not go overvoltage 
+(14V absolute max)
+
 Bidirectional synchronous buck DC/DC converter controller
 
 1 CPU per module
@@ -10,11 +14,7 @@ easier, maybe one bus per cube (12 modules). This allows
 more aggressive analog filtration (RC) without the problem of
 excessive bus capacitance.
 
-STM32F030F4
-4K SRAM
-16K Flash
-48 MHz
-TSSOP20
+STM32F030F4 (4K SRAM, 16K Flash, 48 MHz, TSSOP20)
 
  1 BOOT0      short to 3V3 during powerup to run programming bootloader
  2 PF0     DI Input overvoltage protection - high: input exceeded approx. 14 + 3.3/2 = 15.65V
