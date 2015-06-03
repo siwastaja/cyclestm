@@ -1,5 +1,5 @@
-#define OWN_ID 1
-#define OWN_ID_STR ";1:"
+#define OWN_ID 6
+#define OWN_ID_STR ";6:"
 
 //#define DISABLE_TRIM
 
@@ -39,9 +39,6 @@ volatile int cur_state = STATE_OFF;
 
 volatile int mode_cv = 0;
 
-#define MIN_VOLTAGE 100
-#define MAX_VOLTAGE 4800
-
 // DMA priorities 0 (lowest) .. 3 (highest)
 #define UART_TX_DMA_PRIORITY 1
 
@@ -56,6 +53,8 @@ volatile int rx_point;
 #define GREEN_ON()  {GPIOA->ODR &= ~(1UL << 13);}
 #define GREEN_OFF() {GPIOA->ODR |= 1UL << 13;}
 
+#define FET_PWR_ON() {GPIOF->ODR |= 1UL << 1;}
+#define FET_PWR_OFF() {GPIOF->ODR &= ~(1UL << 1);}
 
 volatile int print_disallow;
 
@@ -99,16 +98,6 @@ void usart_print(const char *buf, int nmax)
 }
 
 
-
-
-// SETV 4200
-// SETI 20000
-// SETI -20000
-// DSCH
-// CHA
-// OFF
-// MEAS
-
 int v_setpoint = 3300;
 int i_setpoint;
 int i_override;
@@ -117,8 +106,8 @@ int i_midpoint_trim; // = 0
 int i_stop;
 int v_stop;
 
-#define MAX_I_TRIM 2000
-#define MIN_I_TRIM -2000
+#define MAX_I_TRIM 2500
+#define MIN_I_TRIM -2500
 #define COARSE_MIDPOINT_TRIM -1000
 #define MIN_MIDPOINT_TRIM -1000
 #define MAX_MIDPOINT_TRIM 1000
@@ -179,6 +168,7 @@ void blink()
 void error(char code)
 {
 	static char msg[12] = ";FATAL x;\0\0";
+	FET_PWR_OFF();
 	DO_OFF();
 	__disable_irq();
 	SET_POSLIMIT(I_MIDPOINT+1000);
@@ -245,7 +235,7 @@ void off()
 	i_trim = 0;
 	i_trim_ignore_cnt = I_TRIM_IGNORE_CNT_VAL;
 
-	blink();
+//	blink();
 	RED_OFF(); GREEN_OFF();
 }
 
@@ -266,6 +256,12 @@ void set_current(int current)
 
 	usart_print(";SETI OK;\r\n", 20);
 	i_trim_ignore_cnt = I_TRIM_IGNORE_CNT_VAL;
+	if(current > 12000 || current < -12000)
+		i_trim_ignore_cnt += 10;
+
+	if(current > 20000 || current < -20000)
+		i_trim_ignore_cnt += 10;
+
 
 }
 
@@ -365,7 +361,7 @@ void calc_adc_vals(int idx)
 
 #define CV_DEADBAND 2
 #define CV_REACT_RATE 1
-#define I_TRIM_REACT_SLOWDOWN 3
+#define I_TRIM_REACT_SLOWDOWN 4
 
 void adjust_i_trim()
 {
@@ -397,6 +393,7 @@ void adjust_charge()
 		if(i_override < 0)
 		{
 			off();
+			i_override = 0;
 		}
 	}
 	else if(v_sense < v_setpoint-CV_DEADBAND && i_override < i_setpoint)
@@ -427,6 +424,7 @@ void adjust_discharge()
 		if(i_override > 0)
 		{
 			off();
+			i_override = 0;
 		}
 	}
 	else if(v_sense > v_setpoint+CV_DEADBAND && i_override > i_setpoint)
@@ -509,10 +507,6 @@ void report_meas(int verbose)
 	out = o_str_append(out, ";\r\n");
 	*out = 0;
 	usart_print(tx_buf, TX_BUF_SIZE);
-
-//	int i_actual = i_meas - i_ref;
-//	int v_actual = (v_sense*v_mult)/v_div;
-
 }
 
 void handle_message()
@@ -557,7 +551,7 @@ void handle_message()
 	else if((p_val = o_str_cmp(p_msg, "SETI ")))
 	{
 		o_atoi_append(p_val, &val);
-		if(val < -25000 || val > 25000)
+		if(val < -27000 || val > 27000)
 		{
 			usart_print(";SETI OOR;\r\n", 20);
 		}
@@ -582,7 +576,7 @@ void handle_message()
 	else if((p_val = o_str_cmp(p_msg, "SETISTOP ")))
 	{
 		o_atoi_append(p_val, &val);
-		if(val < -25000 || val > 25000)
+		if(val < -27000 || val > 27000)
 		{
 			usart_print(";SETISTOP OOR;\r\n", 20);
 		}
@@ -603,6 +597,19 @@ void handle_message()
 		{
 			usart_print(";SETTRIM OK;\r\n", 30);
 			i_midpoint_trim = val;
+		}
+	}
+	else if((p_val = o_str_cmp(p_msg, "SETVCAL ")))
+	{
+		o_atoi_append(p_val, &val);
+		if(val < 4000 || val > 6000)
+		{
+			usart_print(";SETVCAL OOR;\r\n", 30);
+		}
+		else
+		{
+			usart_print(";SETVCAL OK;\r\n", 30);
+			v_mult = val;
 		}
 	}
 	else if((p_val = o_str_cmp(p_msg, "MEAS")))
@@ -627,9 +634,28 @@ void handle_message()
 	}
 	else if((p_val = o_str_cmp(p_msg, "OFF")))
 	{
-		usart_print(";OFF OK;\r\n", 20);
 		off();
+		usart_print(";OFF OK;\r\n", 20);
 	}
+	else if((p_val = o_str_cmp(p_msg, "SHDN")))
+	{
+		off();
+		FET_PWR_OFF();
+		blink();
+		blink();
+		blink();
+		usart_print(";SHDN OK;\r\n", 20);
+	}
+	else if((p_val = o_str_cmp(p_msg, "SHUP")))
+	{
+		off();
+		blink();
+		FET_PWR_ON();
+		blink();
+		blink();
+		usart_print(";SHUP OK;\r\n", 20);
+	}
+
 }
 
 void uart_dma_finished_handler()
@@ -703,6 +729,9 @@ int main()
 	RCC->APB1ENR |= 1UL<<1; // TIM3 clock enable.
 	RCC->APB2ENR = (1UL << 14) | (1UL << 9); // USART1 and ADC
 
+	GPIOF->MODER = 0b0100UL; // PF1: FET driver power control. PF0: input overvoltage signal
+	GPIOF->ODR = 0;
+
 
 	// PORTA:
 	// 13,14 GPO: LEDS
@@ -772,20 +801,15 @@ int main()
 	RED_OFF(); GREEN_OFF();
 
 	int jes = 0;
-	for(jes = 0; jes < 5; jes++)
+	for(jes = 0; jes < 16; jes++)
 		blink();
 
+	FET_PWR_ON();
 
 	NVIC_EnableIRQ(USART1_IRQn);
 	NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
 	__enable_irq();
 
-/*	usart_print(".hei\n\r.", 10);
-	usart_print("heimoijoojuukatohehheh siwa siwa johannes kakka\n\r.", 200);
-	usart_print("hei\n\r.", 10);
-	usart_print("hei\n\r", 10);
-*/
-//	int i = 0;
 	while(1)
 	{
 		int sampleset;
@@ -805,16 +829,16 @@ int main()
 			if(cur_state == STATE_CHA || cur_state == STATE_DSCH)
 			{
 				// Sudden voltage spike, due to battery disconnection etc.
-				if((cur_state == STATE_CHA && v_sense_midflt[sampleset] > v_stop+500) ||
-				   (cur_state == STATE_DSCH && v_sense_midflt[sampleset] < v_stop-500))
+/*				if((v_sense_midflt[sampleset] > v_stop+500) ||
+				   (v_sense_midflt[sampleset] < v_stop-500))
 					error('v');
 
 				if(v_direct > v_sense + V_DIRECT_MAX_DELTA)
-					error('w');
+					error('w');*/
 			}
 
-			if(v_direct > V_DIRECT_MAX)
-				error('V');
+//			if(v_direct > V_DIRECT_MAX)
+//				error('V');
 
 			if(do_handle_message)
 			{

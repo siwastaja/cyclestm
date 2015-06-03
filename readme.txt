@@ -18,7 +18,7 @@ TSSOP20
 
  1 BOOT0      short to 3V3 during powerup to run programming bootloader
  2 PF0     DI Input overvoltage protection - high: input exceeded approx. 14 + 3.3/2 = 15.65V
- 3 PF1    DIO unused - not connected
+ 3 PF1     DO FET driver power control - high: enable power
  4 NRST       reset - not connected
  5 VDDA       Analog 3V3
  6 PA0     AI ADC0 thermistor input
