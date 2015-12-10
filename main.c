@@ -58,6 +58,12 @@ volatile int rx_point;
 
 volatile int print_disallow;
 
+volatile int wdgoff;
+volatile int watchdog;
+#define WATCHDOG_LIMIT 200
+
+#define MIN_CHARGE_START_VOLTAGE 2500
+
 void usart_print(const char *buf, int nmax)
 {
 	int timeout = 1000000;
@@ -168,8 +174,8 @@ void blink()
 void error(char code)
 {
 	static char msg[12] = ";FATAL x;\0\0";
-	FET_PWR_OFF();
 	DO_OFF();
+	FET_PWR_OFF();
 	__disable_irq();
 	SET_POSLIMIT(I_MIDPOINT+1000);
 	SET_NEGLIMIT(I_MIDPOINT-1000);
@@ -234,6 +240,7 @@ void off()
 	SET_NEGLIMIT(IDLE_NEG_I);
 	i_trim = 0;
 	i_trim_ignore_cnt = I_TRIM_IGNORE_CNT_VAL;
+	watchdog = 0;
 
 //	blink();
 	RED_OFF(); GREEN_OFF();
@@ -287,6 +294,11 @@ void discharge()
 void charge()
 {
 	off();
+
+	if(!wdgoff && v_sense < MIN_CHARGE_START_VOLTAGE)
+	{
+		error('C');
+	}
 
 	if(i_setpoint <= 0 || i_setpoint > MAX_POS_I)
 	{
@@ -615,10 +627,12 @@ void handle_message()
 	else if((p_val = o_str_cmp(p_msg, "MEAS")))
 	{
 		report_meas(0);
+		watchdog = 0;
 	}
 	else if((p_val = o_str_cmp(p_msg, "VERB")))
 	{
 		report_meas(1);
+		watchdog = 0;
 	}
 	else if((p_val = o_str_cmp(p_msg, "PAR")))
 	{
@@ -654,6 +668,10 @@ void handle_message()
 		blink();
 		blink();
 		usart_print(";SHUP OK;\r\n", 20);
+	}
+	else if((p_val = o_str_cmp(p_msg, "WDGOFF")))
+	{
+		wdgoff = 1;
 	}
 
 }
@@ -863,6 +881,15 @@ int main()
 		{
 			handle_message();
 			do_handle_message = 0;
+		}
+
+		if((cur_state == STATE_CHA || cur_state == STATE_DSCH) && !wdgoff)
+		{
+			watchdog++;
+			if(watchdog > WATCHDOG_LIMIT)
+			{
+				error('W');
+			}
 		}
 
 		if(cur_state == STATE_CHA)
